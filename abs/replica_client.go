@@ -31,6 +31,7 @@ type ReplicaClient struct {
 	AccountName string
 	AccountKey  string
 	Endpoint    string
+	SASURL      string // SAS URL for authentication (alternative to AccountName/AccountKey)
 
 	// Azure Blob Storage container information
 	Bucket string
@@ -56,34 +57,61 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// Read account key from environment, if available.
-	accountKey := c.AccountKey
-	if accountKey == "" {
-		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
-	}
+	var pipeline *azblob.Pipeline
+	var endpointURL *url.URL
 
-	// Authenticate to ACS.
-	credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
-	if err != nil {
-		return err
-	}
+	// If SAS URL is provided, use it directly
+	if c.SASURL != "" {
+		sasURL, err := url.Parse(c.SASURL)
+		if err != nil {
+			return fmt.Errorf("cannot parse azure SAS URL: %w", err)
+		}
 
-	// Construct & parse endpoint unless already set.
-	endpoint := c.Endpoint
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
-	}
-	endpointURL, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("cannot parse azure endpoint: %w", err)
+		// Extract container URL from SAS URL
+		parts := strings.Split(sasURL.Path, "/")
+		if len(parts) < 2 {
+			return fmt.Errorf("invalid SAS URL format: missing container name")
+		}
+		c.Bucket = parts[1]
+
+		// Create anonymous pipeline for SAS
+		pipeline = azblob.NewPipeline(azblob.NewAnonymousCredential(), azblob.PipelineOptions{
+			Retry: azblob.RetryOptions{
+				TryTimeout: 24 * time.Hour,
+			},
+		})
+		endpointURL = sasURL
+	} else {
+		// Read account key from environment, if available.
+		accountKey := c.AccountKey
+		if accountKey == "" {
+			accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
+		}
+
+		// Authenticate to ACS.
+		credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
+		if err != nil {
+			return err
+		}
+
+		// Construct & parse endpoint unless already set.
+		endpoint := c.Endpoint
+		if endpoint == "" {
+			endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
+		}
+		endpointURL, err = url.Parse(endpoint)
+		if err != nil {
+			return fmt.Errorf("cannot parse azure endpoint: %w", err)
+		}
+
+		pipeline = azblob.NewPipeline(credential, azblob.PipelineOptions{
+			Retry: azblob.RetryOptions{
+				TryTimeout: 24 * time.Hour,
+			},
+		})
 	}
 
 	// Build pipeline and reference to container.
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
-		Retry: azblob.RetryOptions{
-			TryTimeout: 24 * time.Hour,
-		},
-	})
 	containerURL := azblob.NewServiceURL(*endpointURL, pipeline).NewContainerURL(c.Bucket)
 	c.containerURL = &containerURL
 
