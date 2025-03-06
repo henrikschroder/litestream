@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -57,7 +58,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	var pipeline *azblob.Pipeline
+	var p pipeline.Pipeline
 	var endpointURL *url.URL
 
 	// If SAS URL is provided, use it directly
@@ -75,7 +76,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		c.Bucket = parts[1]
 
 		// Create anonymous pipeline for SAS
-		pipeline = azblob.NewPipeline(azblob.NewAnonymousCredential(), azblob.PipelineOptions{
+		p = azblob.NewPipeline(azblob.NewAnonymousCredential(), azblob.PipelineOptions{
 			Retry: azblob.RetryOptions{
 				TryTimeout: 24 * time.Hour,
 			},
@@ -104,7 +105,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot parse azure endpoint: %w", err)
 		}
 
-		pipeline = azblob.NewPipeline(credential, azblob.PipelineOptions{
+		p = azblob.NewPipeline(credential, azblob.PipelineOptions{
 			Retry: azblob.RetryOptions{
 				TryTimeout: 24 * time.Hour,
 			},
@@ -112,7 +113,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 
 	// Build pipeline and reference to container.
-	containerURL := azblob.NewServiceURL(*endpointURL, pipeline).NewContainerURL(c.Bucket)
+	containerURL := azblob.NewServiceURL(*endpointURL, p).NewContainerURL(c.Bucket)
 	c.containerURL = &containerURL
 
 	return nil
