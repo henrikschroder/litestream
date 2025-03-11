@@ -15,6 +15,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
+	"github.com/benbjohnson/litestream/abssas"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
@@ -51,6 +52,11 @@ var (
 	absAccountKey  = flag.String("abs-account-key", os.Getenv("LITESTREAM_ABS_ACCOUNT_KEY"), "")
 	absBucket      = flag.String("abs-bucket", os.Getenv("LITESTREAM_ABS_BUCKET"), "")
 	absPath        = flag.String("abs-path", os.Getenv("LITESTREAM_ABS_PATH"), "")
+)
+
+// Azure blob storage SAS settings
+var (
+	absSASURL = flag.String("abssas-url", os.Getenv("LITESTREAM_ABSSAS_URL"), "")
 )
 
 // SFTP settings
@@ -483,6 +489,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewGCSReplicaClient(tb)
 	case abs.ReplicaClientType:
 		return NewABSReplicaClient(tb)
+	case abssas.ReplicaClientType:
+		return NewABSSASReplicaClient(tb)
 	case sftp.ReplicaClientType:
 		return NewSFTPReplicaClient(tb)
 	default:
@@ -546,6 +554,28 @@ func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
 	c.KeyPath = *sftpKeyPath
 	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
 	return c
+}
+
+// NewABSSASReplicaClient returns a new client for integration testing using SAS URL.
+func NewABSSASReplicaClient(tb testing.TB) *abssas.ReplicaClient {
+	tb.Helper()
+
+	if *absSASURL == "" {
+		tb.Fatal("abssas url required")
+	}
+
+	// Create a new client with the SAS URL
+	client, err := abssas.NewReplicaClient(*absSASURL)
+	if err != nil {
+		tb.Fatalf("cannot create abssas client: %s", err)
+	}
+
+	// Initialize the client
+	if err := client.Init(context.Background()); err != nil {
+		tb.Fatalf("cannot init abssas client: %s", err)
+	}
+
+	return client
 }
 
 // MustDeleteAll deletes all objects under the client's path.

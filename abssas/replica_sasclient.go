@@ -1,4 +1,4 @@
-package abs
+package abssas
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 )
 
 // ReplicaClientType is the client type for this package.
-const ReplicaClientType = "abs"
+const ReplicaClientType = "abssas"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
@@ -27,19 +27,42 @@ type ReplicaClient struct {
 	mu           sync.Mutex
 	containerURL *azblob.ContainerURL
 
-	// Azure credentials
-	AccountName string
-	AccountKey  string
-	Endpoint    string
-
-	// Azure Blob Storage container information
-	Bucket string
-	Path   string
+	container string
+	path      string
+	sasURL    string
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
-func NewReplicaClient() *ReplicaClient {
-	return &ReplicaClient{}
+func NewReplicaClient(sasUrl string) (*ReplicaClient, error) {
+
+	// parse url
+	u, err := url.Parse(sasUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract container name and path from URL
+	pathParts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(pathParts) < 1 {
+		return nil, fmt.Errorf("invalid SAS URL format: missing container name")
+	}
+
+	// First part is the container name
+	container := pathParts[0]
+
+	// The rest is the path (if any)
+	var path string
+	if len(pathParts) > 1 {
+		// Don't add a leading slash to the path - this is causing the "<no name>" folder
+		path = strings.Join(pathParts[1:], "/")
+	}
+
+	client := &ReplicaClient{
+		container: container,
+		path:      path,
+		sasURL:    sasUrl,
+	}
+	return client, nil
 }
 
 // Type returns "abs" as the client type.
@@ -56,35 +79,28 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// Read account key from environment, if available.
-	accountKey := c.AccountKey
-	if accountKey == "" {
-		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
-	}
-
-	// Authenticate to ACS.
-	credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
+	// Parse the SAS URL
+	sasURL, err := url.Parse(c.sasURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot parse SAS URL: %w", err)
 	}
 
-	// Construct & parse endpoint unless already set.
-	endpoint := c.Endpoint
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
-	}
-	endpointURL, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("cannot parse azure endpoint: %w", err)
-	}
-
-	// Build pipeline and reference to container.
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
+	// Create a pipeline using anonymous credentials since auth is in the SAS token
+	pipeline := azblob.NewPipeline(azblob.NewAnonymousCredential(), azblob.PipelineOptions{
 		Retry: azblob.RetryOptions{
 			TryTimeout: 24 * time.Hour,
 		},
 	})
-	containerURL := azblob.NewServiceURL(*endpointURL, pipeline).NewContainerURL(c.Bucket)
+
+	// We need to create a container URL without the path part
+	// First, create a copy of the URL
+	containerURLStr := *sasURL
+
+	// Set the path to just the container part
+	containerURLStr.Path = "/" + c.container
+
+	// Create the container URL
+	containerURL := azblob.NewContainerURL(containerURLStr, pipeline)
 	c.containerURL = &containerURL
 
 	return nil
@@ -101,8 +117,10 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
+		// Use the full path including the path component after the container
+		prefix := litestream.GenerationsPath(c.path) + "/"
 		resp, err := c.containerURL.ListBlobsHierarchySegment(ctx, marker, "/", azblob.ListBlobsSegmentOptions{
-			Prefix: litestream.GenerationsPath(c.Path) + "/",
+			Prefix: prefix,
 		})
 		if err != nil {
 			return nil, err
@@ -127,7 +145,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		return err
 	}
 
-	dir, err := litestream.GenerationPath(c.Path, generation)
+	dir, err := litestream.GenerationPath(c.path, generation)
 	if err != nil {
 		return fmt.Errorf("cannot determine generation path: %w", err)
 	}
@@ -136,7 +154,9 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		// Use the full path including the path component after the container
+		prefix := dir + "/"
+		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}
@@ -173,7 +193,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		return info, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.path, generation, index)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -181,6 +201,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 	rc := internal.NewReadCounter(rd)
 
+	// Use the full path including the path component after the container
 	blobURL := c.containerURL.NewBlockBlobURL(key)
 	if _, err := azblob.UploadStreamToBlockBlob(ctx, rc, blobURL, azblob.UploadStreamToBlockBlobOptions{
 		BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: "application/octet-stream"},
@@ -208,7 +229,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.path, generation, index)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -233,7 +254,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.path, generation, index)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -263,7 +284,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.path, pos.Generation, pos.Index, pos.Offset)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -298,7 +319,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.path, pos.Generation, pos.Index, pos.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -324,7 +345,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	}
 
 	for _, pos := range a {
-		key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+		key, err := litestream.WALSegmentPath(c.path, pos.Generation, pos.Index, pos.Offset)
 		if err != nil {
 			return fmt.Errorf("cannot determine wal segment path: %w", err)
 		}
@@ -372,7 +393,7 @@ func newSnapshotIterator(ctx context.Context, generation string, client *Replica
 func (itr *snapshotIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.SnapshotsPath(itr.client.Path, itr.generation)
+	dir, err := litestream.SnapshotsPath(itr.client.path, itr.generation)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshots path: %w", err)
 	}
@@ -381,7 +402,9 @@ func (itr *snapshotIterator) fetch() error {
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		// Use the full path including the path component after the container
+		prefix := dir + "/"
+		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}
@@ -478,7 +501,7 @@ func newWALSegmentIterator(ctx context.Context, generation string, client *Repli
 func (itr *walSegmentIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.WALPath(itr.client.Path, itr.generation)
+	dir, err := litestream.WALPath(itr.client.path, itr.generation)
 	if err != nil {
 		return fmt.Errorf("cannot determine wal path: %w", err)
 	}
@@ -487,7 +510,9 @@ func (itr *walSegmentIterator) fetch() error {
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		// Use the full path including the path component after the container
+		prefix := dir + "/"
+		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}
