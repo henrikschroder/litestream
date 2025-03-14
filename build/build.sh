@@ -30,7 +30,7 @@ build_windows(){
     -e CGO_ENABLED=1 \
     -e CC=x86_64-w64-mingw32-gcc \
     litestreambuilder \
-    go build -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o ./build/litestream.exe ./cmd/litestream
+    go build -buildvcs=false -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o ./build/litestream.exe ./cmd/litestream
 }
 
 
@@ -46,7 +46,7 @@ build_linux() {
     -e GOOS=linux \
     -e GOARCH=amd64 \
     litestreambuilder \
-    go build -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o ./build/litestream.linux ./cmd/litestream
+    go build -buildvcs=false -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o ./build/litestream.linux ./cmd/litestream
 }
 
 # Display usage information
